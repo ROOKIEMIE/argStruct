@@ -156,6 +156,54 @@ type optionGroup struct {
 	parentFieldName string
 }
 
+func (optGroup *optionGroup) toTable(style Style, indent int) *Table {
+	if optGroup == nil || optGroup.structType == nil {
+		return nil
+	}
+
+	// indent 表示整张表左侧缩进的“字符数”（目前我们假定主要是空格）
+	tbl := InitRenderTable(indent)
+
+	// 为了保持字段输出顺序稳定，按 struct 字段顺序来遍历，
+	// 再用 fieldToOptions 做映射，而不是直接遍历 map。
+	for i := 0; i < optGroup.structType.NumField(); i++ {
+		field := optGroup.structType.Field(i)
+		opt, ok := optGroup.fieldToOptions[field.Name]
+		if !ok {
+			continue
+		}
+
+		// 列 1：alias（带 - / -- 等样式）
+		aliasStr := formatAlias(opt, style)
+
+		// 列 2：Required / Dispensable
+		reqStr := "Dispensable Option"
+		if opt.required {
+			reqStr = "Required Option"
+		}
+
+		// 列 3：描述 + 默认值
+		desc := opt.desc
+		descWithDefault := desc
+		if opt.defaultStr != "" {
+			if descWithDefault != "" {
+				descWithDefault += "  "
+			}
+			descWithDefault += fmt.Sprintf("(default: %s)", opt.defaultStr)
+		}
+
+		// 创建每一行对应的 3 个 Cell
+		row := []*Cell{
+			NewTableCell(aliasStr),
+			NewTableCell(reqStr),
+			NewTableCell(descWithDefault),
+		}
+		tbl.AppendRowWithCells(row)
+	}
+
+	return tbl
+}
+
 func (optGroup *optionGroup) updateCurrentPath(parentPath string) {
 	if parentPath == "" {
 		optGroup.optionGroupPath = optGroup.structName

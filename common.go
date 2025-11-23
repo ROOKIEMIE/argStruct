@@ -26,6 +26,10 @@ func (e *argsErr) ToErr() error {
 	return errors.New(e.ToString())
 }
 
+// ErrHelp 表示用户请求了自动帮助信息（例如传入了 -h/--help）。
+// GetOption 在触发自动帮助时会返回 ErrHelp，调用方可以根据它决定是否退出程序。
+var ErrHelp = errors.New("argStruct: help requested")
+
 const (
 	AliasTagName            = "alias"
 	DescriptionShortTagName = "desc"
@@ -34,8 +38,14 @@ const (
 	DefaultTagName          = "default"
 )
 
-var usageTokenRe = regexp.MustCompile(
-	`\$\{([A-Za-z0-9_]+)\}|\$\[([A-Za-z0-9_]+)\]|\$<([A-Za-z0-9_]+)>`,
+var (
+	usageNameRe = regexp.MustCompile(`\$\{([A-Za-z0-9_.]+)\}`)
+	usageDescRe = regexp.MustCompile(`\$\[([A-Za-z0-9_.]+)\]`)
+	usageReqRe  = regexp.MustCompile(`\$<([A-Za-z0-9_.]+)>`)
+
+	// 整行 $(Group) / $(Global1.Sub1) → 被视为“插入表格”的占位符
+	// 分组 1 捕获前导空白，用于缩进；分组 2 捕获 group token。
+	usageTableRe = regexp.MustCompile(`^(\s*)\$\(([A-Za-z0-9_.]+)\)\s*$`)
 )
 
 func transform(val string, t reflect.Type) (interface{}, error) {
@@ -88,11 +98,6 @@ type ValidationContext struct {
 	self   any                // 当前这一层的 struct 实例（*Sub1）
 	parent *ValidationContext // 上一层的 context，形成链
 	path   string             // 例如 "Root.Sub1"（来自 optionGroup.optionGroupPath）
-
-	// 你如果将来觉得有需要，也可以加：
-	// group  *optionGroup
-	// schema *schema
-	// 只要字段名是小写，用户代码就直接访问不到
 }
 
 // Self 当前这一层（通常是 *YourStruct）
@@ -415,6 +420,84 @@ func formatAlias(opt *option, style Style) string {
 	return strings.Join(aliasWithStyle, "/")
 }
 
+// findGroupForUsageTableToken 根据 $(token) 中的内容解析出对应的 optionGroup：
+//
+// 1. 若 token == 当前 group 的 structName 或 optionGroupPath，则直接用当前 group；
+// 2. 若 token 含 "."，视为完整 groupPath，直接用 ix.groupsByPath 查找；
+// 3. 否则按 structName 在所有 group 中搜索：
+//   - 找到唯一一个匹配 structName 的 group → 使用它；
+//   - 找不到或找到多个（歧义） → 返回 nil。
+func (sc *schema) findGroupForUsageTableToken(token string, curGroup *optionGroup) *optionGroup {
+	// 情况 1：命中当前 group 自己
+	if curGroup != nil && (token == curGroup.structName || token == curGroup.optionGroupPath) {
+		return curGroup
+	}
+
+	// 情况 2：带 "." 的路径形式，直接按 groupPath 查
+	if strings.Contains(token, ".") {
+		if g, ok := sc.ix.groupsByPath[token]; ok {
+			return g
+		}
+		return nil
+	}
+
+	// 情况 3：按 structName 全局搜索
+	var found *optionGroup
+	for _, g := range sc.ix.groupsByPath {
+		if g.structName == token {
+			if found != nil {
+				// 说明有多个同名 struct，歧义，返回 nil 保持模板原样
+				return nil
+			}
+			found = g
+		}
+	}
+	return found
+}
+
+func (sc *schema) resolveNameToken(curGroup *optionGroup, token string, style Style) string {
+	var (
+		targetGroup *optionGroup
+		fieldName   string
+	)
+
+	if strings.Contains(token, ".") {
+		// 路径形式
+		lastDot := strings.LastIndex(token, ".")
+		path := token[:lastDot]       // "Global1.Sub1"
+		fieldName = token[lastDot+1:] // "Username"
+
+		var ok bool
+		targetGroup, ok = sc.ix.groupsByPath[path]
+		if !ok {
+			// 未找到，直接原样返回 token 或给一个占位提示
+			return "${" + token + "}"
+		}
+	} else {
+		// 简名形式，先在当前 group 找
+		fieldName = token
+		targetGroup = curGroup
+	}
+
+	opt, ok := targetGroup.fieldToOptions[fieldName]
+	if !ok {
+		return "${" + token + "}"
+	}
+
+	return formatAlias(opt, style)
+}
+
+func (sc *schema) resolveDescToken(g *optionGroup, token string) string {
+	return g.fieldToOptions[token].desc
+}
+
+func (sc *schema) resolveRequiredToken(g *optionGroup, token string) string {
+	if g.fieldToOptions[token].required {
+		return "Required option"
+	}
+	return "Dispensable option"
+}
+
 /*
 expandUsageTemplate
 
@@ -423,97 +506,119 @@ ${Field} -> 显示该字段的“主 alias”或完整 flag 形式
 $[Field] -> 显示该字段的描述（desc）
 $<Field> -> 显示 REQUIRED/optional 标记（比如 "[Required]" / "[Optional]"）
 */
-func expandUsageTemplate(tpl string, g *optionGroup, style Style) string {
-	return usageTokenRe.ReplaceAllStringFunc(tpl, func(m string) string {
-		sub := usageTokenRe.FindStringSubmatch(m)
-		if len(sub) != 4 {
+func (sc *schema) expandUsageTemplate(tpl string, g *optionGroup, style Style) string {
+	// 1) ${...} -> alias（支持路径）
+	tpl = usageNameRe.ReplaceAllStringFunc(tpl, func(m string) string {
+		sub := usageNameRe.FindStringSubmatch(m)
+		if len(sub) != 2 {
 			return m
 		}
-
-		var (
-			fieldName string
-			kind      int // 1: {}, 2: [], 3: <>
-		)
-		switch {
-		case sub[1] != "":
-			fieldName = sub[1]
-			kind = 1
-		case sub[2] != "":
-			fieldName = sub[2]
-			kind = 2
-		case sub[3] != "":
-			fieldName = sub[3]
-			kind = 3
-		default:
-			return m
-		}
-
-		opt, ok := g.fieldToOptions[fieldName]
-		if !ok {
-			// 这是“开发时错误”，跟 Register 里的 panic 一样，建议直接 panic
-			panic(fmt.Sprintf(
-				"Usage template of %s references unknown field %q",
-				g.structName, fieldName,
-			))
-		}
-
-		switch kind {
-		case 1: // ${Field}
-			return formatAlias(opt, style)
-		case 2: // $[Field]
-			return opt.desc
-		case 3: // $<Field>
-			if opt.required {
-				return "[Required]"
-			}
-			return "[Optional]"
-		default:
-			return m
-		}
+		name := sub[1] // 捕获组 1
+		return sc.resolveNameToken(g, name, style)
 	})
+
+	// 2) $[...] -> desc
+	tpl = usageDescRe.ReplaceAllStringFunc(tpl, func(m string) string {
+		sub := usageDescRe.FindStringSubmatch(m)
+		if len(sub) != 2 {
+			return m
+		}
+		name := sub[1]
+		return sc.resolveDescToken(g, name)
+	})
+
+	// 3) $<...> -> [Required]/[Optional]
+	tpl = usageReqRe.ReplaceAllStringFunc(tpl, func(m string) string {
+		sub := usageReqRe.FindStringSubmatch(m)
+		if len(sub) != 2 {
+			return m
+		}
+		name := sub[1]
+		return sc.resolveRequiredToken(g, name)
+	})
+
+	return tpl
 }
 
 func (sc *schema) writeDefaultGroupUsage(b *strings.Builder, g *optionGroup, style Style) {
+	if g == nil {
+		return
+	}
+
+	// 组名（比如 Sub1 / Global1）
 	b.WriteString(g.structName)
 	b.WriteByte('\n')
 
-	for _, opt := range g.fieldToOptions {
-		aliasStr := formatAlias(opt, style)
-		line := aliasStr
-		// required / optional
-		if opt.required {
-			line += "\tRequired Option"
-		} else {
-			line += "\tDispensable Option"
-		}
+	// 使用一个固定缩进（比如 8 个空格，你可以根据自己的审美再调）
+	const indent = 8
+	tbl := g.toTable(style, indent)
+	if tbl == nil {
+		return
+	}
 
-		// desc
-		if opt.desc != "" {
-			line += "\t" + opt.desc
-		}
-
-		// default
-		if opt.defaultStr != "" {
-			line += "  (default: " + opt.defaultStr + ")"
-		}
-
+	for _, line := range tbl.ToStrings() {
 		b.WriteString(line)
 		b.WriteByte('\n')
 	}
 }
 
-func (sc *schema) appendUsage(b *strings.Builder, g *optionGroup, depth int, style Style) {
-	// 1. 当前 group 自己的 Usage（如果实现了）
+// writeGroupUsageBody 负责渲染“当前 group 自己”的 Usage 内容：
+// - 如果实现了 Usage()，则使用模板 + ${}/$[]/$<> + $(...) 表格展开；
+// - 否则走默认的表格风格（writeDefaultGroupUsage）。
+// 注意：这里不处理前后多余空行，也不递归子 group。
+func (sc *schema) writeGroupUsageBody(b *strings.Builder, g *optionGroup, style Style) {
+	if g == nil {
+		return
+	}
+
 	if up, ok := g.structPtr.(usageProvider); ok {
 		// 用户写的模板
 		raw := up.Usage()
-		rendered := expandUsageTemplate(raw, g, style)
+		// 先展开 ${}/$[]/$<> 这三种占位符
+		rendered := sc.expandUsageTemplate(raw, g, style)
 
+		// 按行处理，支持整行 $(Group) 占位符
 		lines := strings.Split(rendered, "\n")
 		for _, line := range lines {
-			if strings.TrimSpace(line) == "" {
+			// 不要在末尾多加一个空的换行（Split 会保留最后一个空串）
+			if line == "" {
+				b.WriteByte('\n')
 				continue
 			}
+
+			// 先尝试匹配整行 $(...) 模板
+			if sub := usageTableRe.FindStringSubmatch(line); len(sub) == 3 {
+				indentStr := sub[1] // 捕获的前导空白
+				token := sub[2]     // $(...) 里的内容
+
+				// 解析 token 对应的 group
+				tg := sc.findGroupForUsageTableToken(token, g)
+				if tg == nil {
+					// 找不到就原样输出这一行
+					b.WriteString(line)
+					b.WriteByte('\n')
+					continue
+				}
+
+				// 计算缩进宽度，这里简单用 len(indentStr)，因为我们约定 indent 用空格或 Tab。
+				indentWidth := len(indentStr)
+				tbl := tg.toTable(style, indentWidth)
+				if tbl == nil {
+					// 防御性判断：没有表就原样输出
+					b.WriteString(line)
+					b.WriteByte('\n')
+					continue
+				}
+
+				// 用表格内容替换整行 $(...)
+				for _, rowLine := range tbl.ToStrings() {
+					b.WriteString(rowLine)
+					b.WriteByte('\n')
+				}
+				continue
+			}
+
+			// 普通行，直接输出
 			b.WriteString(line)
 			b.WriteByte('\n')
 		}
@@ -521,8 +626,23 @@ func (sc *schema) appendUsage(b *strings.Builder, g *optionGroup, depth int, sty
 		// 没有自定义 Usage 时，生成一个默认块（类似 go-arg/kong 的风格）
 		sc.writeDefaultGroupUsage(b, g, style)
 	}
+}
 
-	// 2. 递归子 group
+func (sc *schema) appendUsage(b *strings.Builder, g *optionGroup, depth int, style Style) {
+	if g == nil {
+		return
+	}
+
+	// 在每个 group 前加一个空行，做视觉分隔
+	b.WriteByte('\n')
+
+	// 渲染当前 group 自己的 Usage 内容
+	sc.writeGroupUsageBody(b, g, style)
+
+	// 在当前 group 后再加一个空行
+	b.WriteByte('\n')
+
+	// 递归子 group
 	for _, child := range sc.ix.groupChildren[g] {
 		sc.appendUsage(b, child, depth+1, style)
 	}
@@ -537,13 +657,63 @@ func (sc *schema) usage(style Style) string {
 	return b.String()
 }
 
-// Usage 对外使用的帮助函数
+// Usage 是对外的默认帮助入口，相当于“打印全部帮助信息”。
+// 内部直接委托给 GetFullUsage，保持行为一致。
 func Usage(config *ParserConfig) string {
-	style := StyleShortDash
-	if config != nil && config.ArgsStyle != 0 {
-		style = config.ArgsStyle
+	return GetFullUsage(config)
+}
+
+// GetFullUsage 获取全局所有已注册参数树的帮助信息。
+// 现在是“全局帮助”的实现；后续如果要支持“按树选择”也可以在这里扩展。
+func GetFullUsage(config *ParserConfig) string {
+	// 规范化 config / ArgsStyle，与 GetOption 保持一致的默认行为
+	if config == nil {
+		config = &ParserConfig{}
 	}
-	return globalSchema.usage(style)
+	if config.ArgsStyle == 0 {
+		config.ArgsStyle = StyleShortDash
+	}
+	return globalSchema.usage(config.ArgsStyle)
+}
+
+// GetUsage 获取某个参数结构体 T 的帮助信息（包含其子树）。
+// T 必须是 struct 类型（与 GetOption 的约束保持一致）。
+//
+// 语义：
+//   - 只渲染 “T 对应的 optionGroup 以及它的子 group” 的帮助信息；
+//   - 如果 T 在 schema 中没有注册，或者注册了多个 group，会 panic 提示。
+func GetUsage[T any](config *ParserConfig) (string, error) {
+	// 规范化 config / ArgsStyle
+	if config == nil {
+		config = &ParserConfig{}
+	}
+	if config.ArgsStyle == 0 {
+		config.ArgsStyle = StyleShortDash
+	}
+
+	// 1) 拿到 T 的类型（要求 T 是 struct，而不是 *struct）
+	var zero *T
+	t := reflect.TypeOf(zero).Elem()
+	if t.Kind() != reflect.Struct {
+		return "", fmt.Errorf("argStruct.GetUsage: T must be struct, got %v", t)
+	}
+
+	// 2) 在 schema 中按类型查找唯一的 optionGroup
+	groups := globalSchema.findGroupsByType(t)
+	switch len(groups) {
+	case 0:
+		return "", fmt.Errorf("argStruct.GetUsage: no optionGroup schema found for type %s", t.Name())
+	case 1:
+		// ok
+	default:
+		return "", fmt.Errorf("argStruct.GetUsage: multiple optionGroups found for type %s", t.Name())
+	}
+	targetGroup := groups[0]
+
+	// 3) 用和全局 Usage 同一套渲染逻辑，但只从 targetGroup 开始递归
+	var buf strings.Builder
+	globalSchema.appendUsage(&buf, targetGroup, 0, config.ArgsStyle)
+	return buf.String(), nil
 }
 
 // 假设已经有 targetGroup 和 rootGroup（或者 path）

@@ -36,6 +36,7 @@ type ParserConfig struct {
 	ArgsSource      Source
 	BoolRepeatAsInc bool
 	ValidateTOnly   bool
+	DisableAutoHelp bool
 }
 
 type fieldState struct {
@@ -57,6 +58,7 @@ type runtime struct {
 	lastPath      []*optionGroup
 
 	validationRoot any
+	helpChecked    bool // 是否已经检查/处理过 auto-help
 
 	err *argsErr
 }
@@ -67,6 +69,60 @@ func newRuntime(args []string, config *ParserConfig) *runtime {
 		rawCliArgs: args,
 		err:        &argsErr{funcName: "GetOption"},
 	}
+}
+
+// handleAutoHelp 检测命令行中是否包含 -h/--help，并在需要时输出 Usage 并返回 ErrHelp。
+// 注意：
+//   - 仅在 ParserConfig.DisableAutoHelp == false 时由 GetOption 调用；
+//   - 只检查 rawCliArgs，不依赖 aliasIndex 的解析结果；
+//   - 如果用户已经将 "h"/"help" 作为 alias 使用，并且命令行中出现了对应的 -h/--help，会返回冲突错误。
+func (r *runtime) handleAutoHelp(config *ParserConfig) error {
+	if r == nil || config == nil {
+		return nil
+	}
+	if r.helpChecked {
+		// 避免同一个 runtime 被多次处理 help
+		return nil
+	}
+	r.helpChecked = true
+
+	// 1) 在原始 argv 中查找 -h/--help
+	helpRequested := false
+	for _, tok := range r.rawCliArgs {
+		if tok == "-h" || tok == "--help" {
+			helpRequested = true
+			break
+		}
+	}
+	if !helpRequested {
+		return nil
+	}
+
+	// 2) 只有当用户实际传入了 -h/--help 时，才去考虑 alias 冲突问题。
+	//    如果用户没传 -h/--help，即使 alias:"h"/"help" 也不算冲突。
+	ix := globalSchema.ix
+	if binds := ix.aliasIndex[aliasKey("h")]; len(binds) > 0 {
+		return fmt.Errorf(
+			"auto help flag \"-h\" conflicts with existing alias \"h\"; " +
+				"please disable auto help by ParserConfig.DisableAutoHelp = true or change the alias",
+		)
+	}
+	if binds := ix.aliasIndex[aliasKey("help")]; len(binds) > 0 {
+		return fmt.Errorf(
+			"auto help flag \"--help\" conflicts with existing alias \"help\"; " +
+				"please disable auto help by ParserConfig.DisableAutoHelp = true or change the alias",
+		)
+	}
+
+	// 3) 打印全局 Usage（这里选择全局帮助，而不是 T 子树帮助）
+	if config.ArgsStyle == 0 {
+		config.ArgsStyle = StyleShortDash
+	}
+	usage := globalSchema.usage(config.ArgsStyle)
+	fmt.Fprint(os.Stdout, usage)
+
+	// 返回一个可识别的 ErrHelp，调用方可以根据它决定是否退出
+	return ErrHelp
 }
 
 func (r *runtime) scanShortDash() error {
@@ -532,15 +588,24 @@ func applyCliArgs[T any](r *runtime) (*T, error) {
 func cache(config *ParserConfig) (*runtime, error) {
 	cacheMutex.RLock()
 	rt := cliCache[config.ArgsSource]
-	if rt != nil && (rt.config.ArgsSource == config.ArgsSource && rt.config.ArgsStyle == config.ArgsStyle) {
+	if rt != nil && rt.config.ArgsSource == config.ArgsSource && rt.config.ArgsStyle == config.ArgsStyle {
+		cacheMutex.RUnlock()
 		return rt, nil
 	}
 	cacheMutex.RUnlock()
 
+	rt = newRuntime(os.Args[1:], config)
+	// 2) 自动帮助：在真正解析字段之前，先检测 -h/--help
+	if !config.DisableAutoHelp {
+		if err := rt.handleAutoHelp(config); err != nil {
+			// 此处 ErrHelp 也会被返回，由调用方决定是否退出
+			return nil, err
+		}
+	}
+
 	// 真正新建
 	switch config.ArgsSource {
 	case SrcCLI:
-		rt = newRuntime(os.Args[1:], config)
 		if err := rt.scanCliArgs(); err != nil {
 			return nil, err
 		}
