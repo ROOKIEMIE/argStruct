@@ -371,6 +371,9 @@ func Register(parentG interface{}, parentOptName string, optG interface{}) {
 
 	for i := 0; i < newOptionGroup.structType.NumField(); i++ {
 		field := newOptionGroup.structType.Field(i)
+		if field.Tag == "" {
+			continue
+		}
 		newOption := &option{}
 		// 填充成员
 		if err := newOption.reflectFillField(newOptionGroup, &field); err != nil {
